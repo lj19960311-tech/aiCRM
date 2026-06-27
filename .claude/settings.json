@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -X POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal -H 'Content-Type: application/json' -d '{ *)",
+      "Bash(curl -s -X POST https://open.feishu.cn/open-apis/docx/v1/documents -H 'Content-Type: application/json' -H 'Authorization: Bearer t-g1046qarED4H7R42QBOEX7ZTGZ2XF6Q5Q4IZFVS6' -d '{ *)",
+      "Bash(curl -s -X POST https://open.feishu.cn/open-apis/docx/v1/documents/M7pddFi93oSoqixEhXYc1gHunZg/blocks/root/children -H 'Authorization: Bearer t-g1046qarED4H7R42QBOEX7ZTGZ2XF6Q5Q4IZFVS6' -H 'Content-Type: application/json' -d '{ *)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s https://open.feishu.cn/open-apis/docx/v1/documents/M7pddFi93oSoqixEhXYc1gHunZg -H 'Authorization: Bearer t-g1046qarED4H7R42QBOEX7ZTGZ2XF6Q5Q4IZFVS6')"
+    ]
+  }
+}

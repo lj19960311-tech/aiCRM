@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 /tmp/check_doc.py)",
+      "Bash(python3 /tmp/feishu_sync_v2.py)"
+    ],
+    "additionalDirectories": []
+  }
+}
