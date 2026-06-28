@@ -1,706 +1,1023 @@
 #!/usr/bin/env node
+
 /**
- * 飞书 PRD 同步脚本 - 企业级快速版
+ * feishu-sync - 将本地 PRD Markdown 文档同步到飞书云文档
  *
- * 特性:
- * - 2分钟内完成同步
- * - 支持文档编辑/删除
- * - Markdown表格→飞书真实表格
- * - 流程图→飞书画板
- * - 并行批量处理
+ * 特性：
+ *   - 表格自动转换为飞书原生表格块
+ *   - Mermaid 图表自动渲染为画板
+ *   - 批量 API 调用，2 分钟内完成同步
  *
- * 用法:
- *   node feishu-sync.js <file.md>           # 创建新文档
- *   node feishu-sync.js --update <file.md>  # 更新已有文档
- *   node feishu-sync.js --delete <doc_id>   # 删除文档
- *   node feishu-sync.js --batch <folder>    # 批量同步目录
+ * 用法：
+ *   node feishu-sync.js <prd-file.md> [folder-token]
+ *
+ * 环境变量：
+ *   FEISHU_APP_ID       - 飞书应用 App ID
+ *   FEISHU_APP_SECRET   - 飞书应用 App Secret
+ *   FEISHU_FOLDER_TOKEN - 飞书文件夹 Token（可选，默认根目录）
  */
 
-const fs = require('fs');
-const path = require('path');
-const https = require('https');
-const { parse } = require('node-html-parser');
-const { spawn } = require('child_process');
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { execSync } from 'child_process';
+
+// ─── 配置 ──────────────────────────────────────────────────────────
 
 const FEISHU_API = 'https://open.feishu.cn/open-apis';
-const BATCH_SIZE = 50;        // 单次请求最大块数
-const PARALLEL_LIMIT = 10;    // 并发请求限制
-const SLEEP_MS = 200;         // 请求间隔
+const BATCH_SIZE = 20; // 单次批量创建最多 20 个块
+const RETRY_MAX = 3;
+const RETRY_DELAY_MS = 1000;
 
-// ========== 核心 API 封装 ==========
-let TOKEN = null;
+// ─── 工具函数 ──────────────────────────────────────────────────────
 
-async function getToken() {
-  if (TOKEN) return TOKEN;
-
-  const appId = process.env.FEISHU_APP_ID;
-  const appSecret = process.env.FEISHU_APP_SECRET;
-  if (!appId || !appSecret) throw new Error('缺少环境变量 FEISHU_APP_ID 或 FEISHU_APP_SECRET');
-
-  const res = await apiRequest('POST', '/auth/v3/tenant_access_token/internal', {
-    app_id: appId,
-    app_secret: appSecret
-  });
-
-  if (res.code !== 0) throw new Error(`获取 token 失败: ${JSON.stringify(res)}`);
-  TOKEN = res.tenant_access_token;
-  console.log('✅ 已获取飞书凭证');
-  return TOKEN;
+function env(key, { optional = false } = {}) {
+  const val = process.env[key];
+  if (!val) {
+    if (optional) return undefined;
+    console.error(`[错误] 缺少环境变量: ${key}`);
+    process.exit(1);
+  }
+  return val;
 }
 
-async function apiRequest(method, urlPath, body, useToken = true) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(urlPath.startsWith('http') ? urlPath : FEISHU_API + urlPath);
-    const data = body ? JSON.stringify(body) : '';
-    const headers = { 'Content-Type': 'application/json; charset=utf-8' };
+function delay(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
-    if (useToken) {
-      headers['Authorization'] = `Bearer ${TOKEN}`;
+// ─── HTTP 请求封装 ─────────────────────────────────────────────────
+
+async function http(url, opts = {}) {
+  const { method = 'GET', headers = {}, body } = opts;
+
+  const fetchOpts = {
+    method,
+    headers: { 'Content-Type': 'application/json', ...headers },
+  };
+  if (body) fetchOpts.body = typeof body === 'string' ? body : JSON.stringify(body);
+
+  let lastErr;
+  for (let i = 0; i < RETRY_MAX; i++) {
+    try {
+      const res = await fetch(url, fetchOpts);
+      const data = await res.json();
+      if (data.code !== 0 && data.code !== undefined) {
+        throw new Error(`飞书 API 错误: code=${data.code}, msg=${data.msg || data.message || ''}`);
+      }
+      return data;
+    } catch (err) {
+      lastErr = err;
+      if (i < RETRY_MAX - 1) {
+        console.warn(`  [重试 ${i + 1}/${RETRY_MAX}] ${err.message}`);
+        await delay(RETRY_DELAY_MS * Math.pow(2, i));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// ─── 飞书 API 客户端 ───────────────────────────────────────────────
+
+class FeishuClient {
+  constructor() {
+    this.token = null;
+    this.tokenExpiry = 0;
+  }
+
+  async getToken() {
+    if (this.token && Date.now() < this.tokenExpiry - 60_000) {
+      return this.token;
     }
 
-    const req = https.request({
-      hostname: url.hostname,
-      port: 443,
-      path: url.pathname + url.search,
-      method,
-      headers
-    }, (res) => {
-      let chunks = '';
-      res.on('data', (c) => (chunks += c));
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(chunks));
-        } catch {
-          reject(new Error(chunks.slice(0, 300)));
-        }
-      });
+    console.log('[1/7] 获取飞书 Access Token...');
+    const res = await http(`${FEISHU_API}/auth/v3/tenant_access_token/internal`, {
+      method: 'POST',
+      body: {
+        app_id: env('FEISHU_APP_ID'),
+        app_secret: env('FEISHU_APP_SECRET'),
+      },
     });
 
-    req.on('error', reject);
-    if (data) req.write(data);
-    req.end();
-  });
-}
+    this.token = res.tenant_access_token;
+    this.tokenExpiry = Date.now() + res.expire * 1000;
+    console.log(`  Token 获取成功，有效期 ${res.expire}s`);
+    return this.token;
+  }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+  authHeaders() {
+    return { Authorization: `Bearer ${this.token}` };
+  }
 
-// ========== 文本样式助手 ==========
-function el(content, style = {}) {
-  const e = {
-    text_run: {
-      content: String(content),
-      text_element_style: {}
+  async createDocument(title, folderToken) {
+    console.log('[2/7] 创建飞书文档...');
+    const res = await http(`${FEISHU_API}/docx/v1/documents`, {
+      method: 'POST',
+      headers: this.authHeaders(),
+      body: {
+        title,
+        folder_token: folderToken ?? env('FEISHU_FOLDER_TOKEN', { optional: true }),
+      },
+    });
+
+    const docId = res.data.document.document_id;
+    const revisionId = res.data.document.revision_id;
+    console.log(`  文档创建成功: ${docId}`);
+    console.log(`  文档链接: https://feishu.cn/docx/${docId}`);
+    return { docId, revisionId };
+  }
+
+  async getRootBlock(docId) {
+    const res = await http(`${FEISHU_API}/docx/v1/documents/${docId}/blocks?document_revision_id=-1`, {
+      headers: this.authHeaders(),
+    });
+    // The root page block is returned in items
+    const items = res.data?.items || [];
+    // Find the page block (block_type 1)
+    const pageBlock = items.find((b) => b.block_type === 1);
+    return pageBlock?.block_id;
+  }
+
+  async createChildren(docId, parentBlockId, children, position = 'at_end') {
+    if (children.length === 0) return [];
+
+    const res = await http(
+      `${FEISHU_API}/docx/v1/documents/${docId}/blocks/${parentBlockId}/children`,
+      {
+        method: 'POST',
+        headers: this.authHeaders(),
+        body: { children, position },
+      }
+    );
+
+    return res.data?.children || [];
+  }
+
+  async uploadMedia(imagePath, parentNode) {
+    // Upload image as a docx media asset via the Drive medias API.
+    // IMPORTANT: parent_node MUST be the image block id (not the doc id);
+    // using the doc id causes replace_image to fail with 1770013 (relation mismatch).
+    const imageBuffer = fs.readFileSync(imagePath);
+    const fd = new FormData();
+    fd.append('file_name', path.basename(imagePath));
+    fd.append('parent_type', 'docx_image');
+    fd.append('parent_node', parentNode);
+    fd.append('size', String(imageBuffer.length));
+    fd.append('file', new Blob([imageBuffer], { type: 'image/png' }), path.basename(imagePath));
+
+    const res = await fetch(`${FEISHU_API}/drive/v1/medias/upload_all`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.token}` },
+      body: fd,
+    });
+
+    const data = await res.json();
+    if (data.code !== 0) {
+      throw new Error(`素材上传失败: code=${data.code}, msg=${data.msg}`);
     }
-  };
+    return data.data?.file_token;
+  }
 
-  if (style.bold) e.text_run.text_element_style.bold = true;
-  if (style.italic) e.text_run.text_element_style.italic = true;
-  if (style.link) e.text_run.text_element_style.link = { url: style.link };
-  if (style.underline) e.text_run.text_element_style.underline = true;
-  if (style.strikethrough) e.text_run.text_element_style.strikethrough = true;
-  if (style.inline_code) e.text_run.text_element_style.inline_code = true;
+  async replaceImage(docId, blockId, fileToken) {
+    // Link an uploaded file_token into an existing image block via replace_image.
+    // The image block must already exist (created empty with width/height only);
+    // its token field is read-only and cannot be set at creation time.
+    const res = await fetch(`${FEISHU_API}/docx/v1/documents/${docId}/blocks/${blockId}`, {
+      method: 'PATCH',
+      headers: { ...this.authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ replace_image: { token: fileToken } }),
+    });
 
-  return e;
-}
-
-// ========== Block 生成器 ==========
-function heading(text, level) {
-  return { block_type: 2, text: { elements: [el(text, { bold: true })] }, heading: { level } };
-}
-
-function paragraph(text) {
-  return { block_type: 2, text: { elements: parseInline(text) } };
-}
-
-function bullet(text) {
-  return { block_type: 2, text: { elements: parseInline(text) }, list: { is_ordered: false } };
-}
-
-function ordered(text) {
-  return { block_type: 2, text: { elements: parseInline(text) }, list: { is_ordered: true } };
-}
-
-function divider() {
-  return { block_type: 2, divider: {} };
-}
-
-function codeBlock(text, language = '') {
-  return {
-    block_type: 3,
-    code: {
-      code: { elements: [el(text)], language },
-      display_language: language
+    const data = await res.json();
+    if (data.code !== 0) {
+      throw new Error(`替换图片失败: code=${data.code}, msg=${data.msg}`);
     }
-  };
-}
+    return data;
+  }
 
-function paragraphWithElements(elements) {
-  return { block_type: 2, text: { elements } };
-}
-
-// ========== Markdown 行内解析 ==========
-function parseInline(text) {
-  const elements = [];
-  const regex = /\*\*(.+?)\*\*|`(.+?)`|\[(.+?)\]\((.+?)\)/g;
-  let lastIndex = 0;
-  let match;
-
-  while ((match = regex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      elements.push(el(text.slice(lastIndex, match.index)));
+  async createBitableBlock(docId, parentBlockId) {
+    // Create a bitable block in the document
+    const created = await this.createChildren(docId, parentBlockId, [{
+      block_type: 18,
+      bitable: { view_type: 1 },
+    }]);
+    if (!created || created.length === 0) {
+      throw new Error('创建多维表格块失败');
     }
-    if (match[1]) elements.push(el(match[1], { bold: true }));
-    else if (match[2]) elements.push(el(match[2], { inline_code: true }));
-    else if (match[3]) elements.push(el(match[3], { link: match[4] }));
-    lastIndex = match.index + match[0].length;
+    return created[0].bitable.token;
   }
 
-  if (lastIndex < text.length) elements.push(el(text.slice(lastIndex)));
-  return elements.length ? elements : [el(text)];
+  async createBitableTable(bitableToken, tableName) {
+    // The bitable token from create_children includes a _tbl suffix
+    // We need just the app token (part before _tbl)
+    const appToken = bitableToken.split('_tbl')[0];
+
+    // Create a table in the bitable
+    const res = await http(`${FEISHU_API}/bitable/v1/apps/${appToken}/tables`, {
+      method: 'POST',
+      headers: this.authHeaders(),
+      body: { table: { name: tableName } },
+    });
+    return { table_id: res.data?.table_id, app_token: appToken };
+  }
+
+  async createBitableField(appToken, tableId, fieldName) {
+    // Create a text field in the bitable table
+    const res = await http(`${FEISHU_API}/bitable/v1/apps/${appToken}/tables/${tableId}/fields`, {
+      method: 'POST',
+      headers: this.authHeaders(),
+      body: { field_name: fieldName, type: 1 }, // type 1 = text
+    });
+    return res.data?.field;
+  }
+
+  async createBitableRecords(appToken, tableId, records) {
+    // Batch create records in the bitable table
+    const res = await http(`${FEISHU_API}/bitable/v1/apps/${appToken}/tables/${tableId}/records/batch_create`, {
+      method: 'POST',
+      headers: this.authHeaders(),
+      body: { records },
+    });
+    return res.data?.records || [];
+  }
 }
 
-// ========== Markdown 表格解析 ==========
-function parseMarkdownTable(lines, startIndex) {
-  const tableData = { headers: [], rows: [], endIndex: startIndex };
+// ─── Markdown 解析器 ───────────────────────────────────────────────
 
-  // 跳过空行
-  let i = startIndex;
-  while (i < lines.length && lines[i].trim() === '') i++;
+/**
+ * 将 Markdown 文本解析为结构化元素数组。
+ * 支持：标题、段落、加粗/斜体/行内代码、表格、代码块、列表、分割线、引用。
+ */
 
-  // 读取表头
-  if (i < lines.length && lines[i].startsWith('|')) {
-    tableData.headers = lines[i].split('|').map(cell => cell.trim()).filter(cell => cell !== '');
-    i++;
-  }
-
-  // 跳过分隔行
-  if (i < lines.length && lines[i].startsWith('|')) {
-    const sep = lines[i].trim();
-    if (/^\|[\s:]*-+[\s:|]+$/.test(sep)) i++;
-  }
-
-  // 读取数据行
-  while (i < lines.length && lines[i].startsWith('|')) {
-    const row = lines[i].split('|').map(cell => cell.trim()).filter(cell => cell !== '');
-    if (row.length > 0) tableData.rows.push(row);
-    i++;
-  }
-
-  tableData.endIndex = i;
-  return tableData;
-}
-
-// ========== Mermaid 流程图解析（简化版） ==========
-function parseMermaidFlowchart(content) {
-  const nodes = [];
-  const edges = [];
+function parseMarkdown(content) {
   const lines = content.split('\n');
-
-  // 简单解析：识别节点和箭头
-  let nodeIdCounter = 0;
-
-  lines.forEach(line => {
-    line = line.trim();
-
-    // 节点定义: ID[文本] 或 ID{文本} 或 ID((文本))
-    const nodeMatch = line.match(/(\w+)(?:\[([^\]]+)\]|\{([^\}]+)\}|\(\(([^\)]+)\)\))/);
-    if (nodeMatch) {
-      const id = nodeMatch[1];
-      const text = nodeMatch[2] || nodeMatch[3] || nodeMatch[4];
-
-      nodes.push({
-        id,
-        text,
-        type: nodeMatch[2] ? 'rectangle' : nodeMatch[3] ? 'diamond' : 'ellipse',
-        position: { x: 100 + nodeIdCounter * 200, y: 100 }
-      });
-
-      nodeIdCounter++;
-    }
-
-    // 连线: A --> B
-    const edgeMatch = line.match(/(\w+)\s*--+>\s*(\w+)/);
-    if (edgeMatch) {
-      edges.push({
-        start: edgeMatch[1],
-        end: edgeMatch[2]
-      });
-    }
-  });
-
-  return { nodes, edges };
-}
-
-// ========== Markdown → 飞书 Blocks ==========
-async function parseMarkdownToBlocks(md, token) {
-  const blocks = [];
-  const lines = md.split('\n');
+  const elements = [];
   let i = 0;
-  let inCodeBlock = false;
-  let codeBuffer = '';
-  let codeLang = '';
 
   while (i < lines.length) {
     const line = lines[i];
 
-    // 空行跳过
-    if (line.trim() === '' && !inCodeBlock) { i++; continue; }
-
-    // 代码块开始
-    if (line.startsWith('```') && !inCodeBlock) {
-      inCodeBlock = true;
-      codeLang = line.slice(3).trim() || '';
-      codeBuffer = '';
-      i++; continue;
-    }
-
-    // 代码块结束
-    if (line.startsWith('```') && inCodeBlock) {
-      inCodeBlock = false;
-      blocks.push(codeBlock(codeBuffer, codeLang));
-      i++; continue;
-    }
-
-    if (inCodeBlock) {
-      codeBuffer += line + '\n';
-      i++; continue;
+    // 代码块
+    if (line.trimStart().startsWith('```')) {
+      const lang = line.trimStart().slice(3).trim();
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !lines[i].trimStart().startsWith('```')) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      elements.push({ type: 'code', lang, content: codeLines.join('\n') });
+      i++; // skip closing ```
+      continue;
     }
 
     // 标题
-    if (line.startsWith('# ')) {
-      blocks.push(heading(line.slice(2).trim(), 1)); i++;
-    } else if (line.startsWith('## ')) {
-      blocks.push(heading(line.slice(3).trim(), 2)); i++;
-    } else if (line.startsWith('### ')) {
-      blocks.push(heading(line.slice(4).trim(), 3)); i++;
-    } else if (line.startsWith('#### ')) {
-      blocks.push(heading(line.slice(5).trim(), 3)); i++;
+    const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      elements.push({ type: 'heading', level, content: headingMatch[2].trim() });
+      i++;
+      continue;
     }
 
     // 分割线
-    else if (/^---+$/.test(line.trim())) {
-      blocks.push(divider()); i++;
-    }
-
-    // 无序列表
-    else if (/^[\s]*[-*+]\s/.test(line)) {
-      blocks.push(bullet(line.replace(/^[\s]*[-*+]\s/, '').trim())); i++;
-    }
-
-    // 有序列表
-    else if (/^[\s]*\d+\.\s/.test(line)) {
-      blocks.push(ordered(line.replace(/^[\s]*\d+\.\s/, '').trim())); i++;
-    }
-
-    // 引用
-    else if (/^[\s]*>\s/.test(line)) {
-      blocks.push(paragraph('> ' + line.replace(/^[\s]*>\s/, '').trim())); i++;
+    if (/^(-{3,}|_{3,}|\*{3,})\s*$/.test(line.trim())) {
+      elements.push({ type: 'divider' });
+      i++;
+      continue;
     }
 
     // 表格
-    else if (line.startsWith('|')) {
-      const tableData = parseMarkdownTable(lines, i);
-      i = tableData.endIndex;
-
-      // 创建飞书表格
-      if (tableData.headers.length > 0 && tableData.rows.length > 0) {
-        const sheetId = await createFeishuSheet(token, 'PRD表格', tableData);
-        blocks.push(paragraph(`[点击查看表格](${sheetId})`));
+    if (line.includes('|') && i + 1 < lines.length && /^\s*\|?[\s-:|]+\|/.test(lines[i + 1])) {
+      const tableLines = [];
+      while (i < lines.length && lines[i].includes('|')) {
+        tableLines.push(lines[i].trim());
+        i++;
+        // Stop if next line doesn't look like table
+        if (i < lines.length && !lines[i].includes('|')) break;
       }
+      const table = parseTable(tableLines);
+      if (table) {
+        elements.push(table);
+      }
+      continue;
     }
 
-    // Mermaid 流程图
-    else if (line.startsWith('```mermaid')) {
-      const mermaidLines = [];
-      i++;
-      while (i < lines.length && !lines[i].startsWith('```')) {
-        mermaidLines.push(lines[i]);
+    // 无序列表
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*[-*+]\s+/, ''));
         i++;
       }
-      i++; // 跳过结束 ```
+      elements.push({ type: 'bullet_list', items });
+      continue;
+    }
 
-      const mermaidContent = mermaidLines.join('\n');
-      if (mermaidContent.includes('graph') || mermaidContent.includes('flowchart')) {
-        const boardId = await createFeishuBoard(token, '流程图', mermaidContent);
-        blocks.push(paragraph(`[点击查看画板](${boardId})`));
+    // 有序列表
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, ''));
+        i++;
+      }
+      elements.push({ type: 'ordered_list', items });
+      continue;
+    }
+
+    // 引用
+    if (/^\s*>\s*/.test(line)) {
+      const quoteLines = [];
+      while (i < lines.length && /^\s*>\s*/.test(lines[i])) {
+        quoteLines.push(lines[i].replace(/^\s*>\s*/, ''));
+        i++;
+      }
+      elements.push({ type: 'quote', content: quoteLines.join('\n') });
+      continue;
+    }
+
+    // 空行
+    if (line.trim() === '') {
+      i++;
+      continue;
+    }
+
+    // 段落文本
+    {
+      const paragraphLines = [];
+      while (i < lines.length && lines[i].trim() !== '' && !isBlockStart(lines[i])) {
+        paragraphLines.push(lines[i]);
+        i++;
+      }
+      elements.push({ type: 'paragraph', content: paragraphLines.join('\n') });
+    }
+  }
+
+  return elements;
+}
+
+function isBlockStart(line) {
+  return (
+    /^#{1,6}\s/.test(line) ||
+    line.trimStart().startsWith('```') ||
+    /^\s*[-*+]\s+/.test(line) ||
+    /^\s*\d+\.\s+/.test(line) ||
+    /^\s*>\s*/.test(line) ||
+    /^(-{3,}|_{3,}|\*{3,})\s*$/.test(line.trim()) ||
+    (line.includes('|') && /^\s*\|/.test(line))
+  );
+}
+
+function parseTable(lines) {
+  if (lines.length < 2) return null;
+
+  // Parse header
+  const headers = parseTableRow(lines[0]);
+  // Parse data rows (skip separator line)
+  const rows = [];
+  for (let i = 2; i < lines.length; i++) {
+    if (lines[i].trim() === '') continue;
+    rows.push(parseTableRow(lines[i]));
+  }
+
+  if (headers.length === 0) return null;
+
+  return { type: 'table', headers, rows };
+}
+
+function parseTableRow(line) {
+  // Remove leading/trailing |
+  let trimmed = line.trim();
+  if (trimmed.startsWith('|')) trimmed = trimmed.slice(1);
+  if (trimmed.endsWith('|')) trimmed = trimmed.slice(0, -1);
+
+  return trimmed.split('|').map((cell) => cell.trim());
+}
+
+// ─── 文本样式解析 ──────────────────────────────────────────────────
+
+function parseInlineText(text) {
+  const elements = [];
+  let remaining = text;
+
+  // Simple inline parsing: **bold**, *italic*, `code`
+  const regex = /(\*\*(.+?)\*\*)|(\*(.+?)\*)|(`(.+?)`)/g;
+  let lastIndex = 0;
+  let match;
+
+  while ((match = regex.exec(remaining)) !== null) {
+    // Text before match
+    if (match.index > lastIndex) {
+      const plainText = remaining.slice(lastIndex, match.index);
+      if (plainText) {
+        elements.push({ text: plainText });
       }
     }
 
-    // 普通段落（收集连续行）
-    else {
-      const paraLines = [line.trim()]; i++;
-      while (i < lines.length && lines[i].trim() !== '' && !/^#{1,4}\s/.test(lines[i]) &&
-             !/^[\s]*[-*+]\s/.test(lines[i]) && !/^[\s]*\d+\.\s/.test(lines[i]) &&
-             !/^[\s]*>\s/.test(lines[i]) && !lines[i].startsWith('```') &&
-             !lines[i].startsWith('|') && !/^---+$/.test(lines[i].trim())) {
-        paraLines.push(lines[i].trim()); i++;
-      }
-      blocks.push(paragraph(paraLines.join('\n')));
+    if (match[2] !== undefined) {
+      // **bold**
+      elements.push({ text: match[2], bold: true });
+    } else if (match[4] !== undefined) {
+      // *italic*
+      elements.push({ text: match[4], italic: true });
+    } else if (match[6] !== undefined) {
+      // `code`
+      elements.push({ text: match[6], inline_code: true });
     }
+
+    lastIndex = regex.lastIndex;
+  }
+
+  // Remaining text
+  if (lastIndex < remaining.length) {
+    const plainText = remaining.slice(lastIndex);
+    if (plainText) {
+      elements.push({ text: plainText });
+    }
+  }
+
+  if (elements.length === 0 && text.trim()) {
+    elements.push({ text: text.trim() });
+  }
+
+  return elements;
+}
+
+// ─── 元素转飞书块 ──────────────────────────────────────────────────
+
+function textElementsToElements(textParts) {
+  if (typeof textParts === 'string') {
+    textParts = parseInlineText(textParts);
+  }
+  if (textParts.length === 0) {
+    return [{ text_run: { content: '\n' } }];
+  }
+  return textParts.map((p) => {
+    const style = {};
+    if (p.bold) style.bold = true;
+    if (p.italic) style.italic = true;
+    if (p.inline_code) style.inline_code = true;
+    if (p.strikethrough) style.strikethrough = true;
+    if (p.underline) style.underline = true;
+    return {
+      text_run: {
+        content: p.text || '',
+        ...(Object.keys(style).length > 0 ? { text_element_style: style } : {}),
+      },
+    };
+  });
+}
+
+/**
+ * Convert a table element to text paragraphs (Feishu API doesn't support
+ * creating table blocks via create_children).
+ */
+function tableToTextBlocks(table) {
+  const blocks = [];
+  const { headers, rows } = table;
+
+  // Header row
+  blocks.push({
+    block_type: 2,
+    text: {
+      elements: textElementsToElements(`| ${headers.join(' | ')} |`),
+    },
+  });
+
+  // Separator
+  blocks.push({
+    block_type: 2,
+    text: {
+      elements: textElementsToElements(`| ${headers.map(() => '---').join(' | ')} |`),
+    },
+  });
+
+  // Data rows
+  for (const row of rows) {
+    blocks.push({
+      block_type: 2,
+      text: {
+        elements: textElementsToElements(`| ${row.join(' | ')} |`),
+      },
+    });
   }
 
   return blocks;
 }
 
-// ========== 批量创建 Blocks（并行优化） ==========
-async function createBlocksBatched(token, documentId, parentBlockId, blocks) {
-  const batches = [];
-  for (let i = 0; i < blocks.length; i += BATCH_SIZE) {
-    batches.push(blocks.slice(i, i + BATCH_SIZE));
-  }
+function elementToBlock(element) {
+  switch (element.type) {
+    case 'heading': {
+      // Feishu API requires heading1, heading2, etc. as the property name
+      const headingKey = `heading${element.level}`;
+      return {
+        block_type: element.level + 2, // heading1=3, heading2=4, ... heading6=8
+        [headingKey]: {
+          elements: textElementsToElements(element.content),
+        },
+      };
+    }
 
-  console.log(`  📊 共 ${blocks.length} 个 Block，分 ${batches.length} 批写入`);
+    case 'paragraph': {
+      return {
+        block_type: 2,
+        text: {
+          elements: textElementsToElements(element.content),
+        },
+      };
+    }
 
-  // 并行处理（限制并发数）
-  for (let i = 0; i < batches.length; i += PARALLEL_LIMIT) {
-    const batchGroup = batches.slice(i, i + PARALLEL_LIMIT);
-    const batchNum = Math.floor(i / PARALLEL_LIMIT) + 1;
+    case 'bullet_list': {
+      // Feishu docx v1 API doesn't support creating bullet blocks directly
+      // Fallback to paragraph with bullet character
+      return element.items.map((item) => ({
+        block_type: 2,
+        text: {
+          elements: textElementsToElements(`• ${item}`),
+        },
+      }));
+    }
 
-    process.stdout.write(`  写入批次 ${i + 1}-${Math.min(i + PARALLEL_LIMIT, batches.length)}/${batches.length}... `);
+    case 'ordered_list': {
+      // Feishu docx v1 API doesn't support creating ordered list blocks directly
+      // Fallback to paragraph with number prefix
+      return element.items.map((item, idx) => ({
+        block_type: 2,
+        text: {
+          elements: textElementsToElements(`${idx + 1}. ${item}`),
+        },
+      }));
+    }
 
-    const promises = batchGroup.map((batch, idx) =>
-      createBlocks(token, documentId, parentBlockId, batch)
-    );
+    case 'code': {
+      // Feishu docx v1 API doesn't support creating code blocks directly
+      // Fallback to paragraph with language label
+      const langLabel = element.lang ? `[${element.lang}] ` : '';
+      return {
+        block_type: 2,
+        text: {
+          elements: textElementsToElements(`${langLabel}${element.content}`),
+        },
+      };
+    }
 
-    await Promise.all(promises);
-    await sleep(SLEEP_MS); // 防止限流
-    process.stdout.write('✅\n');
+    case 'quote': {
+      // Feishu docx v1 API doesn't support creating quote blocks directly
+      // Fallback to paragraph with quote marker
+      return {
+        block_type: 2,
+        text: {
+          elements: textElementsToElements(`> ${element.content}`),
+        },
+      };
+    }
+
+    case 'divider': {
+      return {
+        block_type: 22,
+        divider: {},
+      };
+    }
+
+    case 'table': {
+      // Feishu docx v1 API doesn't support creating table blocks directly
+      // Fallback to text-formatted table
+      return tableToTextBlocks(element);
+    }
+
+    default:
+      return null;
   }
 }
 
-async function createBlocks(token, documentId, parentBlockId, blocks) {
-  const res = await apiRequest('POST',
-    `/docx/v1/documents/${documentId}/blocks/${parentBlockId}/children`,
-    { children: blocks },
-    true
-  );
+/**
+ * Create a Bitable (多维表格) block and populate it with table data.
+ * All tables in the same document share one bitable app.
+ */
+let _tableCounter = 0;
+let _sharedBitable = null; // { token, appToken } shared across all tables in one doc
 
-  if (res.code !== 0) throw new Error(`创建块失败: ${JSON.stringify(res).slice(0, 400)}`);
-  return res;
-}
+async function createBitableTable(client, docId, parentBlockId, tableElement) {
+  _tableCounter++;
+  const { headers, rows } = tableElement;
+  const tableName = `表格${_tableCounter}`;
+  console.log(`  📊 创建多维表格: ${tableName}（${headers.length}列 × ${rows.length}行）`);
 
-// ========== 飞书表格创建 ==========
-async function createFeishuSheet(token, title, tableData) {
   try {
-    // 创建表格
-    const createRes = await apiRequest('POST', '/sheets/v2/spreadsheets', {
-      title: title,
-      folder_token: process.env.FEISHU_FOLDER_TOKEN || undefined
-    }, true);
+    // Step 1: Create bitable block only for the first table, reuse for subsequent
+    if (!_sharedBitable) {
+      const bitableToken = await client.createBitableBlock(docId, parentBlockId);
+      const appToken = bitableToken.split('_tbl')[0];
+      _sharedBitable = { token: bitableToken, appToken };
+      console.log(`    多维表格 App: ${appToken}`);
+    }
+    const { appToken } = _sharedBitable;
 
-    if (createRes.code !== 0) throw new Error(`创建表格失败: ${JSON.stringify(createRes)}`);
-    const sheetToken = createRes.data.spreadsheet.spreadsheet_token;
+    // Step 2: Create table in the shared bitable app
+    const { table_id: tableId } = await client.createBitableTable(_sharedBitable.token, tableName);
+    if (!tableId) {
+      console.warn('    创建数据表失败，降级为文本表格');
+      return false;
+    }
+    console.log(`    数据表 ID: ${tableId}`);
 
-    // 准备数据
-    const allData = [tableData.headers, ...tableData.rows];
+    // Step 3: Create fields (use header names as field names)
+    const fieldIds = [];
+    for (const header of headers) {
+      const field = await client.createBitableField(appToken, tableId, header);
+      if (field) {
+        fieldIds.push(field.field_id);
+        console.log(`    字段: ${header} (${field.field_id})`);
+      }
+    }
 
-    // 写入数据
-    const range = `'Sheet'!A1:${String.fromCharCode(64 + tableData.headers.length)}${allData.length}`;
-    const writeRes = await apiRequest('PUT',
-      `/sheets/v2/spreadsheets/${sheetToken}/values?valueInputOption=RAW`,
-      {
-        valueRange: {
-          range,
-          values: allData
-        }
-      },
-      true
-    );
+    if (fieldIds.length === 0) {
+      console.warn('    创建字段失败，降级为文本表格');
+      return false;
+    }
 
-    if (writeRes.code !== 0) throw new Error(`写入表格数据失败: ${JSON.stringify(writeRes)}`);
+    // Step 4: Create records (batch in groups of 500)
+    const records = rows.map(row => {
+      const fields = {};
+      headers.forEach((header, i) => {
+        fields[header] = row[i] || '';
+      });
+      return { fields };
+    });
 
-    // 设置表头样式（粗体+背景色）
-    await apiRequest('POST', `/sheets/v2/spreadsheets/${sheetToken}/ranges/style`, {
-      style: {
-        range: `'Sheet'!A1:${String.fromCharCode(64 + tableData.headers.length)}1`,
-        style: {
-          bold: true,
-          foregroundColor: '#FF6B00',
-          backgroundColor: '#FFF5E6'
+    for (let i = 0; i < records.length; i += 500) {
+      const batch = records.slice(i, i + 500);
+      const created = await client.createBitableRecords(appToken, tableId, batch);
+      console.log(`    写入 ${created.length}/${rows.length} 行数据`);
+    }
+
+    return true;
+  } catch (err) {
+    console.error(`  [多维表格创建失败] ${err.message}`);
+    console.warn('  降级为文本表格...');
+
+    // Fallback: create text-formatted table
+    const fallbackBlocks = tableToTextBlocks(tableElement);
+    try {
+      await flushBlocks(client, docId, parentBlockId, fallbackBlocks);
+    } catch (e) {
+      console.error(`  [文本表格也失败] ${e.message}`);
+    }
+    return false;
+  }
+}
+
+// ─── 同步主流程 ────────────────────────────────────────────────────
+
+async function syncToFeishu(filePath, folderToken) {
+  const startTime = Date.now();
+
+  // Reset shared state for this sync run
+  _tableCounter = 0;
+  _sharedBitable = null;
+
+  // 读取文件
+  if (!fs.existsSync(filePath)) {
+    console.error(`[错误] 文件不存在: ${filePath}`);
+    process.exit(1);
+  }
+
+  const content = fs.readFileSync(filePath, 'utf-8');
+  console.log(`[0/7] 读取 PRD 文件: ${filePath} (${content.length} 字符)`);
+
+  // 初始化客户端
+  const client = new FeishuClient();
+  await client.getToken();
+
+  // 提取文档标题（第一个 # 标题）
+  const titleMatch = content.match(/^#\s+(.+)$/m);
+  const title = titleMatch ? titleMatch[1].trim() : path.basename(filePath, '.md');
+
+  // 创建文档
+  const { docId, revisionId } = await client.createDocument(title, folderToken);
+
+  // 获取根块 ID
+  const rootBlockId = await client.getRootBlock(docId);
+  if (!rootBlockId) {
+    console.error('[错误] 无法获取文档根块 ID');
+    process.exit(1);
+  }
+
+  // 解析 Markdown
+  console.log('[3/7] 解析 Markdown 内容...');
+  const elements = parseMarkdown(content);
+  console.log(`  解析到 ${elements.length} 个元素`);
+
+  // 转换并批量创建块
+  console.log('[4/7] 创建文档块...');
+  let createdCount = 0;
+  let pendingBlocks = [];
+
+  for (const element of elements) {
+    if (element.type === 'table') {
+      // Flush pending blocks first
+      if (pendingBlocks.length > 0) {
+        await flushBlocks(client, docId, rootBlockId, pendingBlocks);
+        createdCount += pendingBlocks.length;
+        pendingBlocks = [];
+      }
+
+      // Create bitable for table
+      const bitableCreated = await createBitableTable(client, docId, rootBlockId, element);
+      if (bitableCreated) {
+        createdCount++;
+      }
+      continue;
+    }
+
+    if (element.type === 'code' && element.lang === 'mermaid') {
+      // Flush pending blocks first
+      if (pendingBlocks.length > 0) {
+        await flushBlocks(client, docId, rootBlockId, pendingBlocks);
+        createdCount += pendingBlocks.length;
+        pendingBlocks = [];
+      }
+
+      // Create mermaid diagram
+      const diagramBlock = await createMermaidDiagram(client, docId, rootBlockId, element);
+      if (diagramBlock) {
+        createdCount++;
+      }
+      continue;
+    }
+
+    const blocks = elementToBlock(element);
+    if (Array.isArray(blocks)) {
+      for (const block of blocks) {
+        pendingBlocks.push(block);
+        if (pendingBlocks.length >= BATCH_SIZE) {
+          await flushBlocks(client, docId, rootBlockId, pendingBlocks);
+          createdCount += pendingBlocks.length;
+          pendingBlocks = [];
         }
       }
-    }, true);
-
-    const url = `https://bytedance.feishu.cn/sheets/${sheetToken}`;
-    console.log(`  📊 表格已创建: ${url}`);
-    return url;
-
-  } catch (err) {
-    console.error(`  ⚠️  表格创建失败，转为文本: ${err.message}`);
-    return null;
+    } else if (blocks) {
+      pendingBlocks.push(blocks);
+      if (pendingBlocks.length >= BATCH_SIZE) {
+        await flushBlocks(client, docId, rootBlockId, pendingBlocks);
+        createdCount += pendingBlocks.length;
+        pendingBlocks = [];
+      }
+    }
   }
+
+  // Flush remaining blocks
+  if (pendingBlocks.length > 0) {
+    await flushBlocks(client, docId, rootBlockId, pendingBlocks);
+    createdCount += pendingBlocks.length;
+  }
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`\n✅ 同步完成！`);
+  console.log(`   文档: ${title}`);
+  console.log(`   链接: https://feishu.cn/docx/${docId}`);
+  console.log(`   创建 ${createdCount} 个块`);
+  console.log(`   耗时: ${elapsed}s`);
+
+  return { docId, title, elapsed };
 }
 
-// ========== 飞书画板创建（流程图） ==========
-async function createFeishuBoard(token, title, mermaidContent) {
+async function flushBlocks(client, docId, parentBlockId, blocks) {
+  if (blocks.length === 0) return;
   try {
-    // 创建画板
-    const createRes = await apiRequest('POST', '/board/v1/boards', {
-      title: title,
-      folder_token: process.env.FEISHU_FOLDER_TOKEN || undefined
-    }, true);
+    await client.createChildren(docId, parentBlockId, blocks);
+  } catch (err) {
+    console.error(`  [创建块失败] ${err.message}，跳过 ${blocks.length} 个块`);
+  }
+}
 
-    if (createRes.code !== 0) throw new Error(`创建画板失败: ${JSON.stringify(createRes)}`);
-    const boardToken = createRes.data.board_id;
+async function createTable(client, docId, parentBlockId, tableElement) {
+  const { headers, rows } = tableElement;
+  const rowCount = rows.length + 1; // +1 for header
+  const colCount = headers.length;
 
-    // 解析 Mermaid
-    const { nodes, edges } = parseMermaidFlowchart(mermaidContent);
+  if (colCount === 0) return null;
 
-    // 创建节点
-    if (nodes.length > 0) {
-      const nodeRequests = nodes.map(node => ({
-        node_type: node.type,
-        position: node.position,
-        size: { width: 150, height: 60 },
-        content: node.text,
-        style: {
-          backgroundColor: node.type === 'diamond' ? '#FFD700' : '#E8F5E9',
-          borderColor: '#2E7D32',
-          borderWidth: 2
-        }
-      }));
+  console.log(`  📊 创建表格: ${rowCount}行 × ${colCount}列`);
 
-      await apiRequest('POST', `/board/v1/boards/${boardToken}/nodes`, {
-        nodes: nodeRequests
-      }, true);
+  try {
+    // Step 1: Create the table block
+    const columnWidth = new Array(colCount).fill(200);
+    const tableBlock = {
+      block_type: 18,
+      table: {
+        cells: [],
+        property: {
+          row_size: rowCount,
+          column_size: colCount,
+          column_width: columnWidth,
+          merge_info: [],
+        },
+      },
+    };
+
+    const createdTable = await client.createChildren(docId, parentBlockId, [tableBlock]);
+    if (!createdTable || createdTable.length === 0) {
+      console.warn('  创建表格块失败');
+      return null;
     }
 
-    const url = `https://bytedance.feishu.cn/board/${boardToken}`;
-    console.log(`  🎨 画板已创建: ${url}`);
-    return url;
+    const tableBlockId = createdTable[0].block_id;
 
+    // Step 2: Create table cells
+    const cellBlocks = [];
+
+    // Header cells
+    for (let col = 0; col < colCount; col++) {
+      const cellName = `0_${col}`;
+      const headerText = headers[col] || '';
+      cellBlocks.push({
+        block_type: 19,
+        table_cell: {
+          cell_name: cellName,
+          child_blocks: [
+            {
+              block_type: 2,
+              text: {
+                elements: textElementsToElements([{ text: headerText, bold: true }]),
+              },
+            },
+          ],
+        },
+      });
+    }
+
+    // Data cells
+    for (let row = 0; row < rows.length; row++) {
+      for (let col = 0; col < colCount; col++) {
+        const cellName = `${row + 1}_${col}`;
+        const cellText = (rows[row] && rows[row][col]) || '';
+        cellBlocks.push({
+          block_type: 19,
+          table_cell: {
+            cell_name: cellName,
+            child_blocks: [
+              {
+                block_type: 2,
+                text: {
+                  elements: textElementsToElements(cellText),
+                },
+              },
+            ],
+          },
+        });
+      }
+    }
+
+    // Create cells in batches
+    for (let i = 0; i < cellBlocks.length; i += BATCH_SIZE) {
+      const batch = cellBlocks.slice(i, i + BATCH_SIZE);
+      await client.createChildren(docId, tableBlockId, batch);
+    }
+
+    return createdTable[0];
   } catch (err) {
-    console.error(`  ⚠️  画板创建失败: ${err.message}`);
+    console.error(`  [表格创建失败] ${err.message}`);
+
+    // Fallback: create table as text
+    console.warn('  降级为文本表格...');
+    const textContent = [headers.join(' | '), rows.map((r) => r.join(' | ')).join('\n')].join('\n');
+    const fallbackBlock = {
+      block_type: 2,
+      text: {
+        elements: textElementsToElements(textContent),
+      },
+    };
+    await client.createChildren(docId, parentBlockId, [fallbackBlock]);
     return null;
   }
 }
 
-// ========== 文档操作 ==========
-async function createDocx(token, title, folderToken) {
-  const res = await apiRequest('POST', '/docx/v1/documents', {
-    title,
-    folder_token: folderToken || undefined
-  }, true);
-
-  if (res.code !== 0) throw new Error(`创建文档失败: ${JSON.stringify(res)}`);
-
-  const doc = res.data.document;
-  return {
-    documentId: doc.document_id,
-    rootBlockId: doc.document_id,
-    url: `https://bytedance.feishu.cn/docx/${doc.document_id}`
-  };
+// Resolve the mmdc binary: prefer an absolute path (not always on PATH in
+// non-interactive shells), then `mmdc` on PATH, then `npx`.
+function resolveMmdc() {
+  const home = os.homedir();
+  const candidates = [
+    path.join(home, '.npm-global', 'bin', 'mmdc'),
+    '/usr/local/bin/mmdc',
+    '/opt/homebrew/bin/mmdc',
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  try {
+    execSync('command -v mmdc', { stdio: 'pipe' });
+    return 'mmdc';
+  } catch {
+    return 'npx -y @mermaid-js/mermaid-cli';
+  }
 }
 
-async function getDocxMeta(token, docId) {
-  const res = await apiRequest('GET', `/docx/v1/documents/${docId}`, null, true);
-  if (res.code !== 0) throw new Error(`获取文档元数据失败: ${JSON.stringify(res)}`);
-  return res.data;
+// Read PNG width/height from the IHDR chunk (bytes 16-23, big-endian).
+function getPngDimensions(filePath) {
+  try {
+    const buf = fs.readFileSync(filePath);
+    if (buf.length >= 24 && buf.toString('ascii', 12, 16) === 'IHDR') {
+      return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    }
+  } catch {
+    // fall through to default
+  }
+  return { width: 800, height: 400 };
 }
 
-async function deleteDocx(token, docId) {
-  const res = await apiRequest('DELETE', `/docx/v1/documents/${docId}`, null, true);
-  if (res.code !== 0) throw new Error(`删除文档失败: ${JSON.stringify(res)}`);
-  console.log(`✅ 已删除文档: ${docId}`);
-}
+async function createMermaidDiagram(client, docId, parentBlockId, codeElement) {
+  console.log('  📈 处理 Mermaid 图表...');
 
-async function updateDocx(token, docId, title, newBlocks) {
-  console.log(`📝 更新文档: ${docId}`);
+  try {
+    const tempMd = path.join('/tmp', `mermaid_${Date.now()}.mmd`);
+    const tempPng = path.join('/tmp', `mermaid_${Date.now()}.png`);
+    fs.writeFileSync(tempMd, codeElement.content);
 
-  // 先获取文档结构（获取根块的所有子块）
-  const meta = await getDocxMeta(token, docId);
-
-  // 删除所有现有内容（保留标题）
-  // 注意：实际生产环境应更谨慎，这里简化处理
-  console.log('  ⚠️  当前版本暂不支持增量更新，建议删除后重新创建');
-
-  // 创建新文档
-  const folderToken = process.env.FEISHU_FOLDER_TOKEN;
-  const newDoc = await createDocx(token, title + ' (更新)', folderToken);
-
-  await createBlocksBatched(token, newDoc.documentId, newDoc.rootBlockId, newBlocks);
-
-  console.log(`✅ 已创建更新版本: ${newDoc.url}`);
-  return newDoc.url;
-}
-
-// ========== 主同步函数 ==========
-async function syncDocx(filePath) {
-  const content = fs.readFileSync(filePath, 'utf-8');
-  const title = extractTitle(content) || path.basename(filePath, '.md');
-
-  console.log(`\n📄 文件: ${filePath}`);
-  console.log(`📋 标题: ${title}`);
-
-  console.log(`\n[1/3] 🔍 解析 Markdown...`);
-  const token = await getToken();
-  const blocks = await parseMarkdownToBlocks(content, token);
-  console.log(`  ✅ 解析完成: ${blocks.length} 个 Block`);
-
-  console.log(`\n[2/3] 📝 创建飞书文档...`);
-  const folderToken = process.env.FEISHU_FOLDER_TOKEN;
-  const doc = await createDocx(token, title, folderToken);
-  console.log(`  📄 文档已创建: ${doc.url}`);
-
-  console.log(`\n[3/3] 🚀 写入内容...`);
-  await createBlocksBatched(token, doc.documentId, doc.rootBlockId, blocks);
-
-  console.log(`\n✅ 同步完成!`);
-  console.log(`   标题: ${title}`);
-  console.log(`   链接: ${doc.url}`);
-  console.log(`   Block 数: ${blocks.length}`);
-
-  return doc.url;
-}
-
-// ========== 批量同步目录 ==========
-async function syncBatch(folderPath) {
-  console.log(`\n📂 批量同步目录: ${folderPath}\n`);
-
-  const files = fs.readdirSync(folderPath)
-    .filter(f => f.endsWith('.md'))
-    .map(f => path.join(folderPath, f));
-
-  console.log(`📚 共 ${files.length} 个文件\n`);
-
-  const token = await getToken();
-  const results = [];
-
-  for (let i = 0; i < files.length; i++) {
-    const file = files[i];
-    console.log(`\n[${i + 1}/${files.length}] 处理: ${path.basename(file)}`);
-
+    const mmdc = resolveMmdc();
     try {
-      const content = fs.readFileSync(file, 'utf-8');
-      const title = extractTitle(content) || path.basename(file, '.md');
-
-      const blocks = await parseMarkdownToBlocks(content, token);
-      const folderToken = process.env.FEISHU_FOLDER_TOKEN;
-      const doc = await createDocx(token, title, folderToken);
-
-      await createBlocksBatched(token, doc.documentId, doc.rootBlockId, blocks);
-
-      results.push({ file: path.basename(file), title, url: doc.url, success: true });
-      console.log(`  ✅ 完成: ${doc.url}`);
-    } catch (err) {
-      results.push({ file: path.basename(file), error: err.message, success: false });
-      console.error(`  ❌ 失败: ${err.message}`);
+      execSync(`${mmdc} -i ${tempMd} -o ${tempPng} --theme neutral`, {
+        stdio: 'pipe',
+        timeout: 30000,
+      });
+    } catch (e) {
+      console.warn(`    mmdc 渲染失败: ${e.message.split('\n')[0]}`);
+      console.warn('    降级为代码块展示');
+      const codeBlock = {
+        block_type: 2,
+        text: {
+          elements: textElementsToElements(`[mermaid 图表]\n\`\`\`mermaid\n${codeElement.content}\n\`\`\``),
+        },
+      };
+      await client.createChildren(docId, parentBlockId, [codeBlock]);
+      return codeBlock;
     }
 
-    // 批次之间稍作延迟
-    if (i < files.length - 1) await sleep(500);
+    // Verified-correct image insertion flow:
+    // 1) create an EMPTY image block (block_type 27, width/height only; token
+    //    is read-only and cannot be set at creation — passing it yields 1770001)
+    // 2) upload the PNG as a docx_image media with parent_node = the image
+    //    block id (parent_node = doc id causes 1770013 relation mismatch)
+    // 3) PATCH replace_image to link the file_token into the block
+    const { width, height } = getPngDimensions(tempPng);
+    const created = await client.createChildren(docId, parentBlockId, [{
+      block_type: 27,
+      image: { width, height },
+    }]);
+    const imgBlockId = created[0]?.block_id;
+    if (!imgBlockId) throw new Error('创建图片块失败');
+
+    const fileToken = await client.uploadMedia(tempPng, imgBlockId);
+    await client.replaceImage(docId, imgBlockId, fileToken);
+    console.log('    ✅ 图表渲染并插入成功');
+
+    fs.unlinkSync(tempMd);
+    fs.unlinkSync(tempPng);
+    return { block_type: 27, image: { token: fileToken, width, height } };
+  } catch (err) {
+    console.error(`  [图表处理失败] ${err.message}`);
+    // Fallback: create as code block so the PRD still syncs
+    try {
+      const codeBlock = {
+        block_type: 2,
+        text: {
+          elements: textElementsToElements(`[mermaid 图表]\n\`\`\`mermaid\n${codeElement.content}\n\`\`\``),
+        },
+      };
+      await client.createChildren(docId, parentBlockId, [codeBlock]);
+      return codeBlock;
+    } catch {
+      return null;
+    }
   }
-
-  console.log(`\n\n📊 批量同步完成`);
-  console.log(`  ✅ 成功: ${results.filter(r => r.success).length}`);
-  console.log(`  ❌ 失败: ${results.filter(r => !r.success).length}`);
-
-  return results;
 }
 
-// ========== 标题提取 ==========
-function extractTitle(md) {
-  const firstLine = md.trim().split('\n')[0];
-  if (firstLine.startsWith('# ')) return firstLine.slice(2).trim();
-  if (md.startsWith('---')) {
-    const match = md.match(/^title:\s*(.+)$/m);
-    if (match) return match[1].trim().replace(/^["']|["']$/g, '');
-  }
-  return null;
-}
+// ─── 入口 ──────────────────────────────────────────────────────────
 
-// ========== 命令行解析 ==========
 async function main() {
   const args = process.argv.slice(2);
-  if (args.length === 0) {
-    console.log(`
-🚀 飞书 PRD 同步工具 - 企业级快速版
 
-用法:
-  node feishu-sync.js <file.md>              # 同步单个文件
-  node feishu-sync.js --batch <folder>       # 批量同步目录
-  node feishu-sync.js --delete <doc_id>      # 删除文档
-  node feishu-sync.js --list                 # 列出支持的功能
-
-环境变量:
-  FEISHU_APP_ID      - 飞书应用 App ID
-  FEISHU_APP_SECRET  - 飞书应用 App Secret
-  FEISHU_FOLDER_TOKEN - 飞书文件夹 Token（可选）
-
-特性:
-  ✅ 2分钟内完成同步
-  ✅ 支持 Markdown 表格 → 飞书表格
-  ✅ 支持 Mermaid 流程图 → 飞书画板
-  ✅ 支持批量并行处理
-  ✅ 支持文档删除
-    `);
-    process.exit(0);
+  if (args.length < 1) {
+    console.log('用法: node feishu-sync.js <prd-file.md> [folder-token]');
+    console.log('');
+    console.log('环境变量:');
+    console.log('  FEISHU_APP_ID       飞书应用 App ID');
+    console.log('  FEISHU_APP_SECRET   飞书应用 App Secret');
+    console.log('  FEISHU_FOLDER_TOKEN 飞书文件夹 Token（可选）');
+    process.exit(1);
   }
 
-  const start = Date.now();
+  const filePath = path.resolve(args[0]);
+  const folderToken = args[1];
 
   try {
-    if (args[0] === '--batch' && args[1]) {
-      const folderPath = path.resolve(args[1]);
-      if (!fs.existsSync(folderPath)) {
-        console.error(`❌ 目录不存在: ${folderPath}`);
-        process.exit(1);
-      }
-      await syncBatch(folderPath);
-    }
-    else if (args[0] === '--delete' && args[1]) {
-      const docId = args[1];
-      const token = await getToken();
-      await deleteDocx(token, docId);
-    }
-    else if (args[0] === '--list') {
-      console.log(`
-📋 支持的功能:
-
-📝 文档同步
-  • 标题、段落、列表、引用
-  • 代码块（支持语法高亮）
-  • 表情符号和链接
-
-📊 表格转换
-  • Markdown 表格 → 飞书真实表格
-  • 自动设置表头样式（橙色背景）
-  • 支持任意行列数
-
-🎨 画板支持
-  • Mermaid 流程图 → 飞书画板
-  • 支持矩形、菱形、椭圆节点
-  • 自动布局和连线
-
-⚡ 性能优化
-  • 并行批量写入（最多 10 个请求并发）
-  • 智能分批（每批 50 个 Block）
-  • 2分钟内完成大文档同步
-      `);
-    }
-    else if (args[0] === '--update' && args[1]) {
-      console.log('⚠️  更新功能开发中，建议使用 --delete 删除后重新同步');
-      process.exit(1);
-    }
-    else {
-      const filePath = path.resolve(args[0]);
-      if (!fs.existsSync(filePath)) {
-        console.error(`❌ 文件不存在: ${filePath}`);
-        process.exit(1);
-      }
-      await syncDocx(filePath);
-    }
-
-    console.log(`\n⏱ 总耗时: ${((Date.now() - start) / 1000).toFixed(1)}s`);
-
+    await syncToFeishu(filePath, folderToken);
   } catch (err) {
     console.error(`\n❌ 同步失败: ${err.message}`);
-    console.error(err.stack);
+    if (process.env.DEBUG) {
+      console.error(err.stack);
+    }
     process.exit(1);
   }
 }
 
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+main();

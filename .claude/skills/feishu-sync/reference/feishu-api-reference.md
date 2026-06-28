@@ -1,255 +1,312 @@
-# 飞书 API 调用参考
+# 飞书开放平台 API 参考
 
-## API 基础信息
+## 认证
 
-### 域名
+### 获取 Tenant Access Token
 
 ```
-https://open.feishu.cn/open-apis/
-```
-
-### 认证方式
-
-```bash
 POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal
+Content-Type: application/json
 
 {
-  "app_id": "cli_xxx",
-  "app_secret": "xxx"
+  "app_id": "cli_xxxx",
+  "app_secret": "xxxx"
+}
+
+Response:
+{
+  "code": 0,
+  "tenant_access_token": "t-xxxx",
+  "expire": 7200
 }
 ```
 
-返回 `tenant_access_token`（有效期 7200 秒），后续调用携带 `Authorization: Bearer {token}`。
+所有后续请求需在 Header 中携带：
+```
+Authorization: Bearer {tenant_access_token}
+```
 
----
-
-## 文档（Docx）API
+## 云文档 API
 
 ### 创建文档
 
-```bash
-POST /open-apis/docx/v1/documents
-
-{
-  "title": "文档标题",
-  "folder_token": "fldcn_xxx"
-}
 ```
-
-### 创建块（写入内容）
-
-```bash
-POST /open-apis/docx/v1/documents/{document_id}/blocks/{block_id}/children
+POST https://open.feishu.cn/open-apis/docx/v1/documents
+Content-Type: application/json
+Authorization: Bearer {token}
 
 {
-  "children": [
-    {
-      "block_type": 1,
-      "text": {
-        "elements": [{
-          "text_run": {
-            "content": "正文内容",
-            "text_element_style": { "bold": false }
-          }
-        }]
-      }
+  "folder_token": "fldcnxxxx",
+  "title": "文档标题"
+}
+
+Response:
+{
+  "code": 0,
+  "data": {
+    "document": {
+      "document_id": "doxcnxxxx",
+      "revision_id": 1
     }
-  ]
-}
-```
-
-### 更新块
-
-```bash
-PATCH /open-apis/docx/v1/documents/{document_id}/blocks/{block_id}
-
-{
-  "text": {
-    "elements": [{
-      "text_run": { "content": "新内容" }
-    }]
   }
 }
 ```
 
-### 删除块
+### 获取文档块列表
 
-```bash
-DELETE /open-apis/docx/v1/documents/{document_id}/blocks/{block_id}
+```
+GET https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks?document_revision_id=-1
+Authorization: Bearer {token}
 ```
 
-### 行内样式
+### 批量创建子块
 
-`text_element_style` 支持：
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `bold` | boolean | 粗体 |
-| `italic` | boolean | 斜体 |
-| `strikethrough` | boolean | 删除线 |
-| `underline` | boolean | 下划线 |
-| `link` | object | `{ url: "https://..." }` 超链接 |
-
----
-
-## 表格（Sheet）API
-
-### 创建表格
-
-```bash
-POST /open-apis/sheets/v2/spreadsheets
+```
+POST https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}/children
+Content-Type: application/json
+Authorization: Bearer {token}
 
 {
-  "title": "表格标题",
-  "folder_token": "fldcn_xxx"
+  "children": [
+    {
+      "block_type": 2,
+      "text": {
+        "elements": [
+          { "text_run": { "content": "Hello World" } }
+        ]
+      }
+    }
+  ],
+  "position": "at_end"
 }
-```
 
-### 写入数据
-
-```bash
-PUT /open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values
-
+Response:
 {
-  "valueRange": {
-    "range": "'Sheet1'!A1:C3",
-    "values": [
-      ["姓名", "部门", "职位"],
-      ["张三", "技术部", "工程师"],
-      ["李四", "产品部", "经理"]
+  "code": 0,
+  "data": {
+    "children": [
+      { "block_id": "xxxx" }
     ]
   }
 }
 ```
 
-### 读取数据
+### 更新块内容
 
-```bash
-GET /open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values?range='Sheet1'!A1:Z100
 ```
-
-### 创建新工作表
-
-```bash
-POST /open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/sheets
+POST https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}/children
+Content-Type: application/json
 
 {
-  "sheet": {
-    "title": "新功能表",
-    "index": 1
-  }
+  "children": [...],
+  "position": "before",
+  "sibling_block_id": "xxxx"
 }
 ```
 
-### 设置单元格样式
+### 删除块
 
-```bash
-POST /open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/ranges/style
+```
+DELETE https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{block_id}
+Authorization: Bearer {token}
+```
 
+## 块类型对照
+
+| block_type | 名称 | 说明 |
+|------------|------|------|
+| 1 | Page | 页面根块 |
+| 2 | Text | 普通文本/段落 |
+| 3 | Heading1 | 一级标题 |
+| 4 | Heading2 | 二级标题 |
+| 5 | Heading3 | 三级标题 |
+| 6 | Heading4 | 四级标题 |
+| 7 | Heading5 | 五级标题 |
+| 8 | Heading6 | 六价标题 |
+| 11 | Bullet | 无序列表 |
+| 12 | Ordered | 有序列表 |
+| 13 | Code | 代码块 |
+| 14 | Quote | 引用块 |
+| 18 | Table | 表格 |
+| 19 | TableCell | 表格单元格 |
+| 22 | Divider | 分割线 |
+| 27 | Image | 图片 |
+| 31 | Iframe | 嵌入式内容 |
+
+## 文本元素样式
+
+```json
 {
-  "style": {
-    "range": "'Sheet1'!A1:D1",
-    "style": {
-      "foregroundColor": "#FF6B00",
-      "bold": true
+  "text_run": {
+    "content": "文本内容",
+    "text_element_style": {
+      "bold": true,
+      "italic": false,
+      "strikethrough": false,
+      "inline_code": false
     }
   }
 }
 ```
 
----
+## 表格块结构
 
-## 画板（Board）API
+### 创建表格
+
+表格通过批量创建子块实现，结构如下：
+
+```
+Page (根块)
+  └── Table (block_type: 18)
+        ├── TableCell (19, cell_name: "0_0")
+        │     └── Text (2, paragraph)
+        ├── TableCell (19, cell_name: "0_1")
+        │     └── Text (2, paragraph)
+        ├── TableCell (19, cell_name: "1_0")
+        │     └── Text (2, paragraph)
+        └── ...
+```
+
+### 创建步骤
+
+1. **先创建 Table 块**：
+
+```json
+{
+  "block_type": 18,
+  "table": {
+    "cells": [],
+    "property": {
+      "row_size": 3,
+      "column_size": 3,
+      "column_width": [200, 200, 200],
+      "merge_info": []
+    }
+  }
+}
+```
+
+2. **再为 Table 创建 TableCell 子块**：
+
+```json
+{
+  "block_type": 19,
+  "table_cell": {
+    "cell_name": "0_0",
+    "child_blocks": [
+      {
+        "block_type": 2,
+        "text": {
+          "elements": [
+            { "text_run": { "content": "单元格内容" } }
+          ]
+        }
+      }
+    ]
+  }
+}
+```
+
+### 表格合并单元格
+
+`merge_info` 数组，每个元素对应一个合并区域：
+
+```json
+"merge_info": [
+  { "row_index": 0, "col_index": 0, "row_span": 1, "col_span": 2 }
+]
+```
+
+## 图片上传
+
+> 注意：往 docx 文档插入图片**不能**用 `/im/v1/images`（IM 图片接口，仅支持
+> `image_type=message/avatar`，传 `docx_image` 会返回 234001）。文档图片必须走
+> 云文档素材接口，分三步完成。
+
+### 1. 创建空的图片块（block_type 27，不传 token）
+
+`token` 是只读字段，创建时传 token 会返回 1770001（invalid param）。只传宽高：
+
+```
+POST https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{parent_block_id}/children
+Authorization: Bearer {token}
+
+{
+  "children": [
+    { "block_type": 27, "image": { "width": 800, "height": 400 } }
+  ],
+  "position": "at_end"
+}
+```
+
+响应中的 `children[0].block_id` 即图片块 id。
+
+### 2. 上传素材（parent_node 必须为图片块 id）
+
+`parent_node` 必须是**图片块 id**（不是文档 id）；用文档 id 会导致下一步
+`replace_image` 返回 1770013（relation mismatch）。
+
+```
+POST https://open.feishu.cn/open-apis/drive/v1/medias/upload_all
+Content-Type: multipart/form-data
+Authorization: Bearer {token}
+
+Form:
+  file_name:   "diagram.png"
+  parent_type:  "docx_image"
+  parent_node:  "{图片块 block_id}"
+  size:         1239
+  file:         (binary)
+```
+
+响应：`{ "code": 0, "data": { "file_token": "xxxx" } }`
+
+### 3. 替换图片（replace_image 写入 token）
+
+```
+PATCH https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{图片块 block_id}
+Authorization: Bearer {token}
+
+{ "replace_image": { "token": "{file_token}" } }
+```
+
+所需权限：`drive:drive` 或 `docs:document.media:upload`（非 `im:resource`）。
+
+## 画板 (MindNote) API
 
 ### 创建画板
 
-```bash
-POST /open-apis/board/v1/boards
+```
+POST https://open.feishu.cn/open-apis/sheets/v2/spreadsheets
+Content-Type: application/json
 
 {
-  "title": "画板标题",
-  "folder_token": "fldcn_xxx"
+  "folder_token": "fldcnxxxx",
+  "title": "画板标题"
 }
 ```
 
-### 添加节点
+### 画板中插入内容
 
-```bash
-POST /open-apis/board/v1/boards/{board_token}/nodes
+通过画板的 block API 写入内容，支持：
+- 文本框
+- 图片
+- 连接线
+- 便签
 
-{
-  "nodes": [
-    {
-      "node_type": "text",
-      "position": { "x": 100, "y": 100 },
-      "size": { "width": 200, "height": 60 },
-      "content": "节点文本"
-    }
-  ]
-}
-```
+## 速率限制
 
-### 添加连线
-
-```bash
-POST /open-apis/board/v1/boards/{board_token}/edges
-
-{
-  "edges": [
-    {
-      "edge_type": "line",
-      "start_node_id": "node_xxx",
-      "end_node_id": "node_yyy",
-      "start_side": "bottom",
-      "end_side": "top"
-    }
-  ]
-}
-```
-
-### 节点类型参考
-
-| node_type | 说明 |
-|-----------|------|
-| `text` | 文本框 |
-| `rectangle` | 矩形 |
-| `ellipse` | 椭圆 |
-| `diamond` | 菱形 |
-| `line` | 连线 |
-| `arrow` | 箭头 |
-| `stick_note` | 便签 |
-
----
-
-## 完整同步流程
-
-```
-1. 获取 tenant_access_token
-2. 根据类型创建对应文档（Docx/Sheet/Board）
-3. 解析本地内容并写入
-4. 返回飞书链接
-```
-
-**限流**：3次/秒，建议每次写入后 `sleep 0.5`
-**单次上限**：文档单次最多 50 个块
-
----
+- 获取 Token：50 次/分钟
+- 创建文档：50 次/分钟
+- 批量创建块：50 次/分钟，单次最多 20 个子块
+- 上传文件：20 次/分钟
 
 ## 错误码
 
-| 错误码 | 说明 | 处理方式 |
-|--------|------|----------|
+| 错误码 | 说明 | 处理 |
+|--------|------|------|
 | 0 | 成功 | - |
-| 99991400 | 参数错误 | 检查请求参数 |
-| 99991401 | 认证失败 | 重新获取 token |
+| 99991400 | 请求参数错误 | 检查参数格式 |
+| 99991401 | 认证失败 | 重新获取 Token |
 | 99991403 | 权限不足 | 检查应用权限 |
-| 99991404 | 资源不存在 | 检查 ID/Token |
 | 99991429 | 频率限制 | 等待后重试 |
-
----
-
-## 参考链接
-
-- [文档 API](https://open.feishu.cn/document/server-docs/docs/docs/docx-v1/docx-overview)
-- [表格 API](https://open.feishu.cn/document/server-docs/docs/sheets-v2)
-- [画板 API](https://open.feishu.cn/document/server-docs/docs/board-v1/overview)
