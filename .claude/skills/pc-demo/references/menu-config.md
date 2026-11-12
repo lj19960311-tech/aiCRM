@@ -2,159 +2,119 @@
 
 ## 数据结构
 
-菜单配置使用嵌套数组结构，与 antd Menu 的 `items` 属性兼容：
+AI 销售秘书的菜单采用**自定义侧边栏**实现（非 antd Menu），结构在 `components/SideMenu/index.jsx` 中定义。
 
-```js
-// config/menu.js 或 router/index.jsx 中导出
+### 三类菜单项
 
-const menuConfig = [
+```jsx
+// 1. 新建对话按钮（独立于导航列表）
+// 位于侧边栏顶部，黑色背景，点击导航到 /home
+
+// 2. navItems - 常规导航项（专家技能、我的文件、客户笔记）
+const navItems = [
   {
-    key: 'sales',           // 唯一标识，一级菜单
-    label: '销售中心',       // 显示文字
-    icon: <ShoppingOutlined />,  // antd 图标
-    children: [
-      {
-        key: 'product-sales',    // 二级菜单
-        label: '商品销售',
-        children: [
-          {
-            key: '/sales/order/list',     // 三级菜单，key 即路由路径
-            label: '订单列表',            // 同时作为标签页文字
-          },
-          {
-            key: '/sales/order/return',
-            label: '退货单列表',
-          },
-        ],
-      },
-      {
-        key: 'sales-report',
-        label: '销售报表',
-        children: [
-          {
-            key: '/sales/report/daily',
-            label: '日报表',
-          },
-        ],
-      },
-    ],
+    key: '/skills',
+    label: '专家技能',
+    icon: <SVGIcon />,
+    activeBg: '#f0eefb',     // 选中时背景（浅紫）
+    activeColor: '#6d5ef0',  // 选中时文字色
   },
   {
-    key: 'purchase',
-    label: '采购中心',
-    icon: <ShopOutlined />,
-    children: [
-      // ... 二级、三级菜单
-    ],
+    key: '/outputs',
+    label: '我的文件',
+    icon: <SVGIcon />,
+    activeBg: '#f0eefb',
+    activeColor: '#6d5ef0',
+    margin: '14px 0 2px',   // 可选，用于分组间距
   },
-];
+  {
+    key: '/memory',
+    label: '客户笔记',
+    icon: <SVGIcon />,
+    activeBg: '#f0eefb',
+    activeColor: '#6d5ef0',
+  },
+]
+
+// 3. agentItems - 智能体项（金牌陪练、智能讲解）
+const agentItems = [
+  {
+    key: '/coach',
+    label: '金牌陪练',
+    emoji: '🎯',
+    badge: '智能体',
+    badgeColor: '#c77b4a',
+    badgeBg: '#fdf1e7',
+    activeBg: '#fdf1e7',     // 选中时背景（橙色系）
+    activeColor: '#b4552d',  // 选中时文字色（橙色）
+  },
+  {
+    key: '/present',
+    label: '智能讲解',
+    emoji: '🎤',
+    badge: '内测预览',
+    badgeColor: '#6d5ef0',
+    badgeBg: '#f0eefb',
+    activeBg: '#f0eefb',
+    activeColor: '#6d5ef0',
+  },
+]
+```
+
+## 完整菜单结构
+
+```
+┌─────────────────────────┐
+│  🟣 AI销售秘书           │  ← Logo + 系统名
+│  [搜索框]                │
+├─────────────────────────┤
+│  [+] 新建对话            │  ← 黑色按钮，导航到 /home
+├─────────────────────────┤
+│  📂 专家技能             │  ← navItems
+│  📁 我的文件             │
+│  📝 客户笔记             │
+├─────────────────────────┤
+│  智能体                  │  ← 分组标题
+│  🎯 金牌陪练 [智能体]    │  ← agentItems
+│  🎤 智能讲解 [内测预览]  │
+├─────────────────────────┤
+│  ▾ 历史对话              │  ← 可折叠
+│  ⏱ 到底怎么提升销售技巧  │
+│  ⏱ 娃哈哈整车物流方案    │
+│  ⏱ 农夫山泉客户分析      │
+└─────────────────────────┘
 ```
 
 ## 配置规则
 
 1. **key 命名规则**：
-   - 一级菜单：英文单词，如 `sales`、`purchase`、`warehouse`
-   - 二级菜单：`一级-描述`，如 `product-sales`、`purchase-order`
-   - 三级菜单：**必须是路由路径**，如 `/sales/order/list`，因为点击三级菜单会导航到该路由
+   - 常规导航和智能体使用路径格式，如 `/skills`、`/coach`
+   - key 必须与 `App.jsx` 中的路由 path 完全一致
 
 2. **label 字段**：
    - 使用简洁中文名称
-   - 三级菜单的 label 会作为导航标签页的显示文字，保持一致
+   - 与页面标题保持一致
 
-3. **icon 字段**：
-   - 仅一级菜单需要配置图标
-   - 使用 `@ant-design/icons` 提供的图标
+3. **图标**：
+   - navItems 使用内联 SVG 图标（stroke="currentColor"）
+   - agentItems 使用 emoji 表情图标
 
-4. **路由与菜单联动**：
-   - 菜单配置和路由配置保持同步
-   - 新增菜单项时同步新增路由
-   - 三级菜单的 key 必须与路由 path 完全一致
+4. **Badge 标签**：
+   - 仅智能体项需要配置 badge
+   - 用于标识类型（"智能体"、"内测预览"等）
 
-## 示例：供应链管理菜单
+5. **配色方案**：
+   - 常规导航：紫色系（`#f0eefb` 背景 + `#6d5ef0` 文字）
+   - 金牌陪练：橙色系（`#fdf1e7` 背景 + `#b4552d` 文字）
+   - 智能讲解：紫色系（同常规导航）
 
-```js
-const menuConfig = [
-  {
-    key: 'sales',
-    label: '销售中心',
-    icon: <ShoppingCartOutlined />,
-    children: [
-      {
-        key: 'product-sales',
-        label: '商品销售',
-        children: [
-          { key: '/sales/order/list', label: '订单列表' },
-          { key: '/sales/contract/list', label: '合同列表' },
-          { key: '/sales/customer/list', label: '客户列表' },
-        ],
-      },
-      {
-        key: 'sales-return',
-        label: '销售退货',
-        children: [
-          { key: '/sales/return/list', label: '退货单列表' },
-        ],
-      },
-    ],
-  },
-  {
-    key: 'purchase',
-    label: '采购中心',
-    icon: <ShopOutlined />,
-    children: [
-      {
-        key: 'purchase-order',
-        label: '采购订单',
-        children: [
-          { key: '/purchase/order/list', label: '采购单列表' },
-          { key: '/purchase/plan/list', label: '采购计划' },
-        ],
-      },
-      {
-        key: 'supplier-mgmt',
-        label: '供应商管理',
-        children: [
-          { key: '/purchase/supplier/list', label: '供应商列表' },
-        ],
-      },
-    ],
-  },
-  {
-    key: 'warehouse',
-    label: '仓储中心',
-    icon: <InboxOutlined />,
-    children: [
-      {
-        key: 'inventory',
-        label: '库存管理',
-        children: [
-          { key: '/warehouse/inventory/list', label: '库存查询' },
-          { key: '/warehouse/inbound/list', label: '入库单列表' },
-          { key: '/warehouse/outbound/list', label: '出库单列表' },
-        ],
-      },
-    ],
-  },
-  {
-    key: 'finance',
-    label: '财务中心',
-    icon: <AccountBookOutlined />,
-    children: [
-      {
-        key: 'receivable',
-        label: '应收管理',
-        children: [
-          { key: '/finance/receivable/list', label: '应收账单' },
-        ],
-      },
-      {
-        key: 'payable',
-        label: '应付管理',
-        children: [
-          { key: '/finance/payable/list', label: '应付账单' },
-        ],
-      },
-    ],
-  },
-];
-```
+6. **历史对话**：
+   - 使用 `histData` 数组管理
+   - 支持折叠/展开
+   - 点击跳转到 `/home`
+
+## 新增菜单项步骤
+
+1. 在 `SideMenu/index.jsx` 的 `navItems` 或 `agentItems` 中添加配置
+2. 在 `App.jsx` 添加对应的 Route
+3. 在 `pages/` 下创建页面组件
